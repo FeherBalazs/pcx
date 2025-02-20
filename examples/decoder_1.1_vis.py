@@ -2,12 +2,18 @@ from typing import Callable
 
 import jax
 import jax.numpy as jnp
+import equinox as eqx
+import torch
+import numpy as np
+import optax
 
 import pcx as px
 import pcx.predictive_coding as pxc
 import pcx.nn as pxnn
 import pcx.utils as pxu
-import equinox as eqx
+import pcx.functional as pxf
+
+from utils_dataloader import get_dataloaders
 
 STATUS_FORWARD = "forward"
 
@@ -23,7 +29,6 @@ class Decoder(pxc.EnergyModule):
     ) -> None:
         super().__init__()
 
-        self.input_dim = input_dim  # store input dimension for later use
         self.act_fn = px.static(act_fn)
 
         self.layers = (
@@ -38,7 +43,8 @@ class Decoder(pxc.EnergyModule):
             [
                 pxc.Vode(
                     energy_fn=None,
-                    ruleset={pxc.STATUS.INIT: ("h, u <- u:to_zero",)},
+                    ruleset={
+                        pxc.STATUS.INIT: ("h, u <- u:to_zero",)},
                     tforms={"to_zero": lambda n, k, v, rkg: jnp.zeros((input_dim,))},
                 )
             ]
@@ -48,7 +54,7 @@ class Decoder(pxc.EnergyModule):
                 # of the node state; this is used during evaluation to generate the encoded output.
                 pxc.Vode(
                     ruleset={
-                        pxc.STATUS.INIT: ("h, u <- u:to_zero",),
+                        # pxc.STATUS.INIT: ("h, u <- u:to_zero",),
                         STATUS_FORWARD: ("h -> u",)
                     },
                     tforms={"to_zero": lambda n, k, v, rkg: jnp.zeros_like(v)},
@@ -60,8 +66,6 @@ class Decoder(pxc.EnergyModule):
         self.vodes[-1].h.frozen = True
 
     def __call__(self, y: jax.Array | None):
-        # The defined ruleset for the first vode is to set the hidden state to zero,
-        # independent of the input, so we always pass '-1' (as None would skip the computation).
         x = self.vodes[0](jnp.empty(()))
         for i, layer in enumerate(self.layers):
             act_fn = self.act_fn if i != len(self.layers) - 1 else lambda x: x
@@ -72,106 +76,6 @@ class Decoder(pxc.EnergyModule):
             self.vodes[-1].set("h", y.flatten())
 
         return self.vodes[-1].get("u")
-
-import torch
-import numpy as np
-
-
-# The dataloader assumes cuda is being used, as such it sets 'pin_memory = True' and
-# 'prefetch_factor = 2'. Note that the batch size should be constant during training, so
-# we set 'drop_last = True' to avoid having to deal with variable batch sizes.
-class TorchDataloader(torch.utils.data.DataLoader):
-    def __init__(
-        self,
-        dataset,
-        batch_size=1,
-        shuffle=None,
-        sampler=None,
-        batch_sampler=None,
-        num_workers=1,
-        pin_memory=True,
-        timeout=0,
-        worker_init_fn=None,
-        persistent_workers=True,
-        prefetch_factor=2,
-    ):
-        super(self.__class__, self).__init__(
-            dataset,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            sampler=sampler,
-            batch_sampler=batch_sampler,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            drop_last=True if batch_sampler is None else None,
-            timeout=timeout,
-            worker_init_fn=worker_init_fn,
-            persistent_workers=persistent_workers,
-            prefetch_factor=prefetch_factor,
-        )
-
-import torchvision
-import torchvision.transforms as transforms
-
-
-def get_dataloaders(batch_size: int, train_subset_n: int = None, test_subset_n: int = None, target_class: int = None):
-    t = transforms.Compose(
-        [
-            transforms.ToTensor()
-        ]
-    )
-
-    train_dataset = torchvision.datasets.FashionMNIST(
-        "~/tmp/fashion-mnist/",
-        transform=t,
-        download=True,
-        train=True,
-    )
-    from torch.utils.data import Subset
-    # If target_class is specified, filter the dataset to only include that category.
-    if target_class is not None:
-        # Obtain indices where the target equals the target_class. FashionMNIST stores targets as a tensor.
-        target_indices = (train_dataset.targets == target_class).nonzero(as_tuple=True)[0].tolist()
-        train_dataset = Subset(train_dataset, target_indices)
-
-    # Optionally restrict the training dataset further.
-    if train_subset_n is not None:
-        all_idx = list(range(len(train_dataset)))
-        train_dataset = Subset(train_dataset, all_idx[:train_subset_n])
-
-    train_dataloader = TorchDataloader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=4,
-    )
-
-    test_dataset = torchvision.datasets.FashionMNIST(
-        "~/tmp/fashion-mnist/",
-        transform=t,
-        download=True,
-        train=False,
-    )
-    # If target_class is specified, filter to only that category.
-    if target_class is not None:
-        target_indices = (test_dataset.targets == target_class).nonzero(as_tuple=True)[0].tolist()
-        test_dataset = Subset(test_dataset, target_indices)
-
-    # Similarly, restrict the test dataset if required.
-    if test_subset_n is not None:
-        all_idx = list(range(len(test_dataset)))
-        test_dataset = Subset(test_dataset, all_idx[:test_subset_n])
-
-    test_dataloader = TorchDataloader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=4,
-    )
-
-    return train_dataloader, test_dataloader
-
-import pcx.functional as pxf
 
 
 @pxf.vmap(pxu.M(pxc.VodeParam | pxc.VodeParam.Cache).to((None, 0)), in_axes=0, out_axes=0)
@@ -189,31 +93,59 @@ def energy(*, model: Decoder):
 def train_on_batch(T: int, x: jax.Array, *, model: Decoder, optim_w: pxu.Optim, optim_h: pxu.Optim):
     model.train()
 
-    inference_step = pxf.value_and_grad(pxu.M_hasnot(pxc.VodeParam, frozen=True).to([False, True]), has_aux=True)(
-        energy
-    )
+    h_value, w_value, h_grad, w_grad = None, None, None, None
+
+    inference_step = pxf.value_and_grad(pxu.M_hasnot(pxc.VodeParam, frozen=True).to([False, True]), has_aux=True)(energy)
 
     learning_step = pxf.value_and_grad(pxu.M_hasnot(pxnn.LayerParam).to([False, True]), has_aux=True)(energy)
 
-    # Init step
-    with pxu.step(model, pxc.STATUS.INIT, clear_params=pxc.VodeParam.Cache):
+    # Top down sweep and setting target value (do we need this? we could simply set the target value directly)
+    with pxu.step(model, clear_params=pxc.VodeParam.Cache):
         forward(x, model=model)
 
     optim_h.init(pxu.M_hasnot(pxc.VodeParam, frozen=True)(model))
 
-    # Inference steps
+    # Inference and learning steps
+    # Here we could  add logic to do this until convergence for each sample or batch
     for _ in range(T):
         with pxu.step(model, clear_params=pxc.VodeParam.Cache):
-            _, g = inference_step(model=model)
+            h_value, h_grad = inference_step(model=model)
+        optim_h.step(model, h_grad["model"])
 
-        optim_h.step(model, g["model"])
+        with pxu.step(model, clear_params=pxc.VodeParam.Cache):
+            w_value, w_grad = learning_step(model=model)
+        optim_w.step(model, w_grad["model"], scale_by=1.0/x.shape[0])
     
     optim_h.clear()
 
-    # Learning step
-    with pxu.step(model, clear_params=pxc.VodeParam.Cache):
-        _, g = learning_step(model=model)
-    optim_w.step(model, g["model"], scale_by=1.0/x.shape[0])
+    # with pxu.step(model):
+    #     forward(x, model=model)
+
+    return h_value, w_value, h_grad, w_grad
+
+
+def train(dl, T, *, model: Decoder, optim_w: pxu.Optim, optim_h: pxu.Optim):
+
+    for x, y in dl:
+        # # Extract the first 4 pixel values from x
+        # x_subset = x.numpy().flatten()[:4].reshape(1, 1, 2, 2)  # Reshape to maintain dimensions        
+        # x = torch.tensor(x_subset)
+        # print('x', x)
+
+        h_value, w_value, h_grad, w_grad = train_on_batch(T, x.numpy(), model=model, optim_w=optim_w, optim_h=optim_h)
+
+        # print('h_energy_sum: {}'.format(h_value[0]), '\nh_energy: {}'.format(h_value[1]))
+        # print('w_energy_sum: {}'.format(w_value[0]), '\nw_energy: {}'.format(w_value[1]))
+        # print('h_grad', h_grad['model'])
+        # print('w_grad', w_grad['model'])    
+
+        # for i, vode in enumerate(model.vodes):
+        #         print('vode_h', i, vode.get('h'))
+        # for i, vode in enumerate(model.vodes):
+        #     try:
+        #         print('vode_u', i, vode.get('u'))
+        #     except:
+        #         print('vode', i, vode)
 
 
 @pxf.jit(static_argnums=0)
@@ -246,11 +178,6 @@ def eval_on_batch(T: int, x: jax.Array, *, model: Decoder, optim_h: pxu.Optim):
     loss = jnp.square(jnp.clip(x_hat.flatten(), 0.0, 1.0) - x.flatten()).mean()
 
     return loss, x_hat
-
-
-def train(dl, T, *, model: Decoder, optim_w: pxu.Optim, optim_h: pxu.Optim):
-    for x, y in dl:
-        train_on_batch(T, x.numpy(), model=model, optim_w=optim_w, optim_h=optim_h)
 
 
 def eval(dl, T, *, model: Decoder, optim_h: pxu.Optim):
@@ -330,7 +257,8 @@ def eval_on_batch_for_vis(T: int, x: jax.Array, *, model: Decoder, optim_h: pxu.
         # Use the unmodified flattened image.
         x_input = x_flat
 
-    with pxu.step(model, pxc.STATUS.INIT, clear_params=pxc.VodeParam.Cache):
+    # with pxu.step(model, pxc.STATUS.INIT, clear_params=pxc.VodeParam.Cache):
+    with pxu.step(model, clear_params=pxc.VodeParam.Cache):
         forward(x_input, model=model)   # Initialize caches with chosen input (corrupted or not)
     
     optim_h.init(pxu.M_hasnot(pxc.VodeParam, frozen=True)(model))
@@ -415,174 +343,38 @@ def visualize_reconstruction(model, optim_h, T=24, dataset='test', use_corruptio
     # Return the list of original images and reconstructions
     return orig_images, recon_images
 
-import optax
 
-# Global dictionaries for logging activations and weights over epochs.
-activation_log = {}
-weight_log = {}
-
-def forward_with_logging(x, model: Decoder):
-    """
-    A wrapper for the decoder's forward pass that logs intermediate activations.
+if __name__ == '__main__':
+    batch_size = 10
+    nm_epochs = 20
+    target_class = 6
     
-    We follow the same ordering as in the original __call__:
-      - The first VODE module is applied.
-      - Then, for every layer, we record:
-          • The linear output of the layer.
-          • The output after applying the activation function.
-          • The subsequent VODE output.
-      
-    Finally, we record the network output.
-    
-    Returns:
-        activations (dict): A dictionary with keys for each stage (e.g. "linear_0", "act_0", etc.).
-        final_out: The final output from the network (i.e. the reconstruction).
-    """
-    activations = {}
-    # Initialize the first VODE module exactly as in __call__.
-    current = model.vodes[0](jnp.empty(()))
-    activations["vode0"] = {"u": model.vodes[0].get("u"), "h": model.vodes[0].get("h")}
-
-    for i, layer in enumerate(model.layers):
-        # Compute the raw linear output.
-        linear_out = layer(current)
-        activations[f"linear_{i}"] = linear_out
-        
-        # Apply activation (if not the last layer, use model.act_fn, else identity)
-        act_fn = model.act_fn if i != len(model.layers) - 1 else (lambda x: x)
-        activated = act_fn(linear_out)
-        activations[f"act_{i}"] = activated
-        
-        # Pass through the corresponding VODE module and update current with its output.
-        current = model.vodes[i + 1](activated)
-        activations[f"vode_{i+1}"] = {"u": model.vodes[i+1].get("u"), "h": model.vodes[i+1].get("h")}
-
-    # Get the final output from the last VODE.
-    final_u = model.vodes[-1].get("u")
-    final_h = model.vodes[-1].get("h")
-    activations["output"] = {"u": final_u, "h": final_h}
-    final_out = final_u
-    return activations, final_out
-
-def log_weights(model: Decoder):
-    """
-    Log the weights for each layer in the decoder.
-    
-    We assume that each layer in model.layers is a Linear layer that has attributes
-    'W' (weights) and 'b' (bias). Modify accordingly if your implementation differs.
-    
-    Returns:
-        weights (dict): A dictionary keyed by layer indices containing a dict with keys "W" and "b".
-    """
-    weights = {}
-    for i, layer in enumerate(model.layers):
-        try:
-            # For example, if the layer was created via pxnn.Linear it might store weights as:
-            w = layer.W
-            b = layer.b
-        except AttributeError:
-            # Fallback: If weights are stored in a 'params' dictionary.
-            params = getattr(layer, "params", {})
-            w = params.get("W", None)
-            b = params.get("b", None)
-        w_val = jnp.array(w) if w is not None else None
-        b_val = jnp.array(b) if b is not None else None
-        weights[f"layer_{i}"] = {"W": w_val, "b": b_val}
-    return weights
-
-def update_logs(epoch, activations, weights):
-    """
-    Save the activations and weights for the given epoch.
-    """
-    activation_log[epoch] = activations
-    weight_log[epoch] = weights
-
-def plot_activations_over_time(layer_key="act_0"):
-    """
-    Produce a heatmap that shows how the activations in a chosen layer evolve over epochs.
-    If the activation tensor has a batch dimension, we average over it (yielding Epoch x Neuron).
-    """
-    epochs = sorted(activation_log.keys())
-    act_evolution = []
-    for ep in epochs:
-        act = activation_log[ep].get(layer_key)
-        if act is None:
-            continue
-        # Average over batch dimension if needed.
-        act_mean = jnp.mean(act, axis=0) if act.ndim > 1 else act
-        act_evolution.append(np.array(act_mean))
-    act_evolution = np.stack(act_evolution, axis=0)
-    plt.figure(figsize=(8,6))
-    plt.imshow(act_evolution, aspect="auto", cmap="viridis")
-    plt.colorbar()
-    plt.title(f"Evolution of Activations for {layer_key}")
-    plt.xlabel("Neuron Index")
-    plt.ylabel("Epoch")
-    plt.show()
-
-def plot_weight_histogram(layer_key="layer_0", param="W"):
-    """
-    Plot a histogram of weight values from a selected layer accumulated over epochs.
-    """
-    epochs = sorted(weight_log.keys())
-    weight_values = []
-    for ep in epochs:
-        w = weight_log[ep].get(layer_key, {}).get(param)
-        if w is not None:
-            weight_values.extend(np.ravel(np.array(w)))
-    plt.figure(figsize=(8,6))
-    plt.hist(weight_values, bins=50)
-    plt.title(f"Histogram of {param} in {layer_key} (over epochs)")
-    plt.xlabel("Weight Value")
-    plt.ylabel("Frequency")
-    plt.show()
-
-# An optional helper for stopping gradient flow on part of a tensor (if needed)
-def partial_stop_gradient(x, pixel_dim=392):
-    """
-    Stops gradients for the first `pixel_dim` elements of x.
-    """
-    pixels = jax.lax.stop_gradient(x[:, :pixel_dim])
-    labels = x[:, pixel_dim:]
-    return jnp.concatenate([pixels, labels], axis=-1)
-
-def main():
-    # For demonstration, we log a fixed sample over a few epochs.
-    batch_size = 1
-    nm_epochs = 2
-    
-    # Load dataloaders. Adjust target_class or subset counts as needed.
-    train_dl, test_dl = get_dataloaders(batch_size, train_subset_n=100, test_subset_n=100)
-    
-    # Create a model instance.
     model = Decoder(
-        input_dim=64,
-        hidden_dim=512,
+        input_dim=768, 
+        hidden_dim=1024, 
         output_dim=28 * 28,
-        nm_layers=2,
-        act_fn=jax.nn.swish
+        # output_dim=4, 
+        nm_layers=4, 
+        act_fn=jax.nn.gelu
     )
     
-    # Create simple optimizers (only for demonstration; we do not perform full updates here).
-    optim_h = optax.sgd(0.05, momentum=0.1)
-    optim_w = optax.adamw(1e-4)
+    # optim_h = pxu.Optim(lambda: optax.sgd(5e-2, momentum=0.1))
+    optim_h = pxu.Optim(lambda: optax.sgd(5e-2, momentum=0.1))
+    optim_w = pxu.Optim(lambda: optax.adamw(1e-4), pxu.M(pxnn.LayerParam)(model))
     
-    # For visual logging, we use a fixed sample from the test set.
-    import torch
-    it = iter(test_dl)
-    x, label = next(it)  # x shape: (1, 1, 28, 28)
-    x = jnp.array(x.numpy())
+    train_dataloader, test_dataloader = get_dataloaders(batch_size, train_subset_n=100, test_subset_n=100, target_class=target_class)
     
-    for epoch in range(nm_epochs):
-        # Instead of training updates, we run a forward pass with logging.
-        activations, out = forward_with_logging(x, model)
-        weights = log_weights(model)
-        update_logs(epoch, activations, weights)
-        print(f"Logged activations and weights for epoch {epoch}")
+    # Init step setting up h and u value - Shall be done only at the beginning of the training
+    x, _ = next(iter(train_dataloader))
+    # x = torch.tensor(x.numpy().flatten()[:4].reshape(1, 1, 2, 2))
+    with pxu.step(model, pxc.STATUS.INIT, clear_params=pxc.VodeParam.Cache):
+        forward(x.numpy(), model=model)
+
+    for e in range(nm_epochs):
+        train(train_dataloader, T=1, model=model, optim_w=optim_w, optim_h=optim_h)
+        l = eval(test_dataloader, T=1, model=model, optim_h=optim_h)
+        print(f"Epoch {e + 1}/{nm_epochs} - Test Loss: {l:.4f}")
     
-    # Visualize logged activations and weights.
-    plot_activations_over_time("act_0")
-    plot_weight_histogram("layer_0", "W")
-    
-if __name__ == "__main__":
-    main()
+    x_orig, x_recon = visualize_reconstruction(model, optim_h, T=8, use_corruption=True, target_class=target_class)
+
+    # TODO: study mode collapse and add noise to the input
