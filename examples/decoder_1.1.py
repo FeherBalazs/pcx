@@ -1,5 +1,8 @@
 from typing import Callable
 
+import os
+# os.environ['XLA_FLAGS'] = '--xla_gpu_parallel_collective_overlap_limit=4'
+
 import jax
 import jax.numpy as jnp
 
@@ -354,14 +357,15 @@ def eval_on_batch_for_vis(T: int, x: jax.Array, *, model: Decoder, optim_h: pxu.
 
 def visualize_reconstruction(model, optim_h, T=24, dataset='test', use_corruption=False, target_class: int = None):
     """
-    Loads one sample from FashionMNIST and shows a side-by-side plot of
-    the original image and its reconstruction.
+    Loads one sample from FashionMNIST and saves a side-by-side plot of
+    the original image and its reconstruction as a PNG file with timestamp.
     """
     import matplotlib.pyplot as plt
     import torchvision
     import torchvision.transforms as transforms
     import jax.numpy as jnp
     import torch
+    from datetime import datetime
 
     t = transforms.Compose([transforms.ToTensor()])
     ds = torchvision.datasets.FashionMNIST(
@@ -409,7 +413,14 @@ def visualize_reconstruction(model, optim_h, T=24, dataset='test', use_corruptio
         axes[i, 1].set_title('Reconstruction')
         axes[i, 1].axis('off')
     plt.tight_layout()
-    plt.show()
+    
+    # Generate timestamp and filename
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"reconstruction_{timestamp}.png"
+    
+    # Save the figure
+    plt.savefig(filename)
+    plt.close()
 
     # Return the list of original images and reconstructions
     return orig_images, recon_images
@@ -417,15 +428,15 @@ def visualize_reconstruction(model, optim_h, T=24, dataset='test', use_corruptio
 import optax
 
 if __name__ == '__main__':
-    batch_size = 1
+    batch_size = 256
     nm_epochs = 100
-    target_class = 6
+    target_class = None
     
     model = Decoder(
         input_dim=64, 
-        hidden_dim=512, 
+        hidden_dim=2048, 
         output_dim=28 * 28, 
-        nm_layers=2, 
+        nm_layers=8, 
         act_fn=jax.nn.swish
     )
     
@@ -434,11 +445,12 @@ if __name__ == '__main__':
     optim_w = pxu.Optim(lambda: optax.adamw(1e-4), pxu.M(pxnn.LayerParam)(model))
     
     # Only use 100 samples for training and testing.
-    train_dataloader, test_dataloader = get_dataloaders(batch_size, train_subset_n=100, test_subset_n=100, target_class=target_class)
+    train_dataloader, test_dataloader = get_dataloaders(batch_size, train_subset_n=256, test_subset_n=256, target_class=target_class)
     
     for e in range(nm_epochs):
         train(train_dataloader, T=24, model=model, optim_w=optim_w, optim_h=optim_h)
-        l = eval(test_dataloader, T=1, model=model, optim_h=optim_h)
-        print(f"Epoch {e + 1}/{nm_epochs} - Test Loss: {l:.4f}")
+        if (e + 1) % 10 == 0:
+            l = eval(test_dataloader, T=24, model=model, optim_h=optim_h)
+            print(f"Epoch {e + 1}/{nm_epochs} - Test Loss: {l:.4f}")
     
     x_orig, x_recon = visualize_reconstruction(model, optim_h, T=24, use_corruption=True, target_class=target_class)
