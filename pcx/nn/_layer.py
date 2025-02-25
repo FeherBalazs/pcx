@@ -184,7 +184,7 @@ class ConvTranspose(Layer):
             use_bias,
             padding_mode,
             dtype,
-            rkg=rkg,
+            key=rkg(),
             **kwargs,
         )
 
