@@ -20,7 +20,11 @@ import pcx.functional as pxf
 from utils_dataloader import get_dataloaders
 
 STATUS_FORWARD = "forward"
+STATUS_REFINE = "refine"
 
+
+import jax.random as jrandom
+key = jrandom.PRNGKey(42)  # Same seed in both versions
 
 class Decoder(pxc.EnergyModule):
     def __init__(
@@ -59,7 +63,8 @@ class Decoder(pxc.EnergyModule):
                 pxc.Vode(
                     ruleset={
                         # pxc.STATUS.INIT: ("h, u <- u:to_zero",),
-                        # STATUS_FORWARD: ("h -> u",)
+                        # STATUS_FORWARD: ("h -> u",),
+                        # STATUS_REFINE: ("h <- u",)
                     },
                     tforms={"to_zero": lambda n, k, v, rkg: jnp.zeros_like(v)},
                 )
@@ -279,21 +284,14 @@ def eval_on_batch_for_vis_partial(T: int, x: jax.Array, *, model: Decoder, optim
     # Use the regular energy function as set up for training
     inference_step = pxf.value_and_grad(pxu.M_hasnot(pxc.VodeParam, frozen=True).to([False, True]), has_aux=True)(energy)
     
-    # Determine the expected batch size. We'll look at the first VODE element.
-    expected_bs = 1
-    for vode in model.vodes:
-        if vode.h._value is not None:
-            expected_bs = vode.h._value.shape[0]
-            break
-
-    # If x's batch size does not match expected_bs, replicate along batch axis.
-    if x.shape[0] != expected_bs:
-        x_batch = jnp.repeat(x, expected_bs, axis=0)
-    else:
-        x_batch = x
+    # Get the model's expected batch size
+    expected_bs = model.vodes[0].h._value.shape[0]
+    
+    # Repeat the input to match the expected batch size
+    x = jnp.repeat(x, expected_bs, axis=0)
 
     # Flatten x_batch to shape (batch_size, 784) since FashionMNIST images are 28x28.
-    x_flat = jnp.reshape(x_batch, (x_batch.shape[0], -1))
+    x_flat = jnp.reshape(x, (x.shape[0], -1))
 
     # Create mask: True for known pixels (upper half), False for missing (lower half)
     mask = jnp.arange(784) < 784 * corrupt_ratio
@@ -346,7 +344,7 @@ def eval_on_batch_for_vis_partial(T: int, x: jax.Array, *, model: Decoder, optim
         x_hat_batch = forward(None, model=model)
     
     # x_batch is available from before; reshape it to compare with reconstructed images.
-    x_orig_flat = jnp.reshape(x_batch, (x_batch.shape[0], -1))
+    x_orig_flat = jnp.reshape(x, (x.shape[0], -1))
 
     # Compute loss across the whole batch.
     loss = jnp.mean(jnp.square(jnp.clip(x_hat_batch, 0.0, 1.0) - x_orig_flat))
@@ -368,12 +366,14 @@ def visualize_reconstruction(model, optim_h, train_dataloader, T_values=[24], us
     recon_images = {T: [] for T in T_values}  # Dictionary to store reconstructions for each T
     labels_list = []
 
-    # Create iterator once
-    dataloader_iter = iter(train_dataloader)
-
+    # Reset model state for visualization
+    with pxu.step(model, pxc.STATUS.INIT, clear_params=pxc.VodeParam.Cache):
+        x, _ = next(iter(train_dataloader))
+        forward(x.numpy(), model=model)
+    
     # Collect num_images samples from the DataLoader
     for i in range(num_images):
-        x, label = next(dataloader_iter)  # Get a single image and its label
+        x, label = next(iter(train_dataloader))  # Get a single image and its label
         x = jnp.array(x.numpy())
 
         # Get reconstructions for each T value
@@ -419,8 +419,8 @@ def visualize_reconstruction(model, optim_h, train_dataloader, T_values=[24], us
 
 
 if __name__ == '__main__':
-    batch_size = 1
-    nm_epochs = 20
+    batch_size = 16
+    nm_epochs = 50
     target_class = None
     
     model = Decoder(
@@ -450,6 +450,6 @@ if __name__ == '__main__':
         l = eval(test_dataloader, T=8, model=model, optim_h=optim_h)
         print(f"Epoch {e + 1}/{nm_epochs} - Test Loss: {l:.4f}")
     
-    x_orig, x_recon = visualize_reconstruction(model, optim_h, train_dataloader, T_values=[0, 1, 8, 64, 500], use_corruption=True, corrupt_ratio=0.5, target_class=target_class)
+    x_orig, x_recon = visualize_reconstruction(model, optim_h, train_dataloader, T_values=[0, 1, 8, 64, 100], use_corruption=True, corrupt_ratio=0.5, target_class=target_class)
 
     # TODO: study mode collapse and add noise to the input
