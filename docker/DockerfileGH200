@@ -5,10 +5,13 @@
 # Also make sure to change the fix at the very end of this file.
 FROM nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04
 
+# Prevent interactive prompts during build
+ENV DEBIAN_FRONTEND=noninteractive
+
 # Install Python 3.11 and pip3
 RUN apt update \
     && apt install --fix-missing -y software-properties-common \
-    && add-apt-repository ppa:deadsnakes/ppa \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
     && apt install --fix-missing -y python3.11 python3.11-venv python3.11-dev python3-pip curl vim less openssh-client \
     && ln -s $(which python3.11) /usr/bin/python \
     && ln -s $(which python3.11) /usr/bin/python3
