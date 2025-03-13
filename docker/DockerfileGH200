@@ -36,7 +36,9 @@ ENV PATH="$PATH:/home/pcax/.local/bin:" \
     # and this PR: https://github.com/python-poetry/poetry/pull/5251
     PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring \
     # Prevent JAX from allocating 90% of GPU memory:
-    XLA_PYTHON_CLIENT_PREALLOCATE="false"
+    XLA_PYTHON_CLIENT_PREALLOCATE="false" \
+    # Set XLA version to match CUDA driver
+    XLA_CUDA_VERSION="12.4.0"
 
 RUN poetry config virtualenvs.create false
 
