@@ -13,6 +13,7 @@ RUN apt update \
     && apt install --fix-missing -y software-properties-common \
     && add-apt-repository -y ppa:deadsnakes/ppa \
     && apt install --fix-missing -y python3.11 python3.11-venv python3.11-dev python3-pip curl vim less openssh-client \
+    && rm -f /usr/bin/python /usr/bin/python3 \
     && ln -s $(which python3.11) /usr/bin/python \
     && ln -s $(which python3.11) /usr/bin/python3
 
