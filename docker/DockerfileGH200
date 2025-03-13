@@ -40,8 +40,23 @@ ENV PATH="$PATH:/home/pcax/.local/bin:" \
 
 RUN poetry config virtualenvs.create false
 
-# https://stackoverflow.com/a/31532674/4119680
-COPY --chown=pcax:pcax pyproject.toml poetry.loc[k] ./
+# Copy the entire project
+COPY --chown=pcax:pcax . .
 
+# Install dependencies
 RUN poetry install --no-root
+
+# Install PyTorch (CPU version as we are using JAX for GPU PyTorch is only for dataloader utilities) and local package
+RUN pip install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cpu \
+    && pip install -e ./
+
+# Install specific versions with GPU support
+RUN pip install matplotlib \
+    && pip install --upgrade pip \
+    && pip uninstall -y jax jaxlib \
+    && pip install "jax[cuda12_pip]==0.4.33" -f https://storage.googleapis.com/jax-releases/cuda12_pip.html \
+    && pip install "jaxlib==0.4.33" -f https://storage.googleapis.com/jax-releases/cuda12_pip.html \
+    && pip install equinox==0.11.7 optax==0.2.3
+
+
 
