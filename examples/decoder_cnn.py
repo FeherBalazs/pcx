@@ -1,3 +1,7 @@
+import multiprocessing
+# Set the start method to 'spawn' instead of 'fork'
+multiprocessing.set_start_method('spawn', force=True) 
+
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
