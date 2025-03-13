@@ -88,7 +88,7 @@ def get_dataloaders(
         train_dataset = torchvision.datasets.CIFAR10(
             root=dataset_root,
             transform=transform,
-            download=False,
+            download=True,
             train=True,
         )
         test_dataset = torchvision.datasets.CIFAR10(
